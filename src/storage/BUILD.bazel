@@ -586,6 +586,18 @@ cc_library(
 )
 
 cc_library(
+    name = "fts_test_headers",
+    testonly = True,
+    hdrs = [
+        "fts/ik/ob_ik_char_util.h",
+        "fts/utils/unicode_utils.h",
+    ],
+    deps = ["//src/oblib:oblib_foundation"],
+    tags = ["manual"],
+    visibility = ["//unittest/storage/fts:__pkg__"],
+)
+
+cc_library(
     name = "tx_replay_test_headers",
     testonly = True,
     hdrs = ["tx/ob_tx_replay_executor.h"],
