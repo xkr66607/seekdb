@@ -592,7 +592,7 @@ cc_library(
         "fts/ik/ob_ik_char_util.h",
         "fts/utils/unicode_utils.h",
     ],
-    deps = ["//src/oblib:oblib_foundation"],
+    deps = ["//src/oblib:oblib_base"],
     tags = ["manual"],
     visibility = ["//unittest/storage/fts:__pkg__"],
 )

@@ -10,6 +10,7 @@ import argparse, re, subprocess, tempfile
 parser = argparse.ArgumentParser(description='Isolated old/new IK classifier check; not a database benchmark')
 parser.add_argument('--baseline', required=True, help='Unmodified commit to compare against')
 parser.add_argument('--cxx', default='c++', help='C++ compiler executable')
+parser.add_argument('--zig', action='store_true', help='Invoke the compiler with the Zig c++ subcommand')
 args = parser.parse_args()
 r=Path(__file__).resolve().parents[3]
 tmp = tempfile.TemporaryDirectory(prefix='ik-component-')
@@ -57,13 +58,36 @@ a=sh.index('template<ObCharsetType cs_type>')
 b=sh.index('class ObFastStringScanner')
 shim+=mb[start:end]+'\nnamespace oceanbase { namespace common {\n'+sh[a:b]+'\n}}\n'
 shim+=strip((r/'src/storage/fts/utils/unicode_utils.h').read_text(encoding='utf-8'))
-(o/'shim.h').write_text(shim)
+(o/'shim.h').write_text(shim, encoding='utf-8')
 header=strip((r/'src/storage/fts/ik/ob_ik_char_util.h').read_text(encoding='utf-8'))
-old=subprocess.check_output(['git','show',args.baseline + ':src/storage/fts/ik/ob_ik_char_util.h'],cwd=r,text=True)
+old=subprocess.check_output(['git','show',args.baseline + ':src/storage/fts/ik/ob_ik_char_util.h'],cwd=r,text=True,encoding='utf-8')
 old=strip(old).replace('_OCEANBASE_STORAGE_FTS_IK_OB_IK_CHAR_UTIL_H_','LEGACY_CHAR_UTIL_H').replace('ObFTCharUtil','LegacyCharUtil')
-(o/'new.h').write_text('#include "shim.h"\n'+header)
-(o/'old.h').write_text('#include "shim.h"\n'+old)
-(o/'unicode.cpp').write_text('#include "shim.h"\n'+strip((r/'src/storage/fts/utils/unicode_utils.cpp').read_text(encoding='utf-8')))
+(o/'new.h').write_text('#include "shim.h"\n'+header, encoding='utf-8')
+(o/'old.h').write_text('#include "shim.h"\n'+old, encoding='utf-8')
+(o/'unicode.cpp').write_text('#include "shim.h"\n'+strip((r/'src/storage/fts/utils/unicode_utils.cpp').read_text(encoding='utf-8')), encoding='utf-8')
+def function(source, signature):
+    start = source.index(signature)
+    begin = source.index('{', start)
+    depth = 1
+    end = begin + 1
+    while depth:
+        depth += (source[end] == '{') - (source[end] == '}')
+        end += 1
+    return source[start:end]
+stream_path = 'src/share/text_analysis/ob_token_stream.cpp'
+new_stream = (r/stream_path).read_text(encoding='utf-8')
+old_stream = subprocess.check_output(['git', 'show', args.baseline + ':' + stream_path], cwd=r, text=True, encoding='utf-8')
+signature = 'int ObTokenStopWordNormalizer::filter_special_marks('
+filters = r"""
+struct ObDatum { const char *ptr_; unsigned len_; };
+struct Table { unsigned char flags[256]; };
+bool ob_ispunct(const Table *cs, char c) { return cs->flags[(unsigned char)c] & 1; }
+bool ob_iscntrl(const Table *cs, char c) { return cs->flags[(unsigned char)c] & 2; }
+struct NewFilter { Table *cs_; int filter_special_marks(const ObDatum &, bool &); };
+struct OldFilter { Table *cs_; int filter_special_marks(const ObDatum &, bool &); };
+"""
+filters += function(new_stream, signature).replace('ObTokenStopWordNormalizer', 'NewFilter')
+filters += function(old_stream, signature).replace('ObTokenStopWordNormalizer', 'OldFilter')
 main=r'''
 #include "new.h"
 #include "old.h"
@@ -75,13 +99,31 @@ main=r'''
 using namespace oceanbase::storage;
 static unsigned long long checks=0;
 void check(const char *p, uint8_t n, ObCharsetType cs) {
-  ObFTCharUtil::CharType a; LegacyCharUtil::CharType b;
+  ObFTCharUtil::CharType a = ObFTCharUtil::CharType::USELESS;
+  LegacyCharUtil::CharType b = LegacyCharUtil::CharType::USELESS;
   int x=ObFTCharUtil::classify_first_char(cs,p,n,a);
   int y=LegacyCharUtil::classify_first_char(cs,p,n,b);
-  if(x!=y || int(a)!=int(b)) {std::printf("Mismatch n=%u cs=%d\n",n,int(cs));std::abort();}
+  if(x!=y || int(a)!=int(b)) {std::printf("Mismatch n=%u cs=%d\n",n,int(cs));std::fflush(stdout);std::abort();}
   ++checks;
 }
 int main() {
+  Table table{};
+  NewFilter nf{&table}; OldFilter of{&table};
+  bool valid_new, valid_old;
+  char pair[2];
+  for (int trial=0; trial<4; ++trial) {
+    for(int c=0;c<256;++c) table.flags[c]=(c+trial)%4;
+    for(int first=0;first<256;++first) for(int last=0;last<256;++last) {
+      pair[0]=char(first);pair[1]=char(last);
+      ObDatum datum{pair,2};
+      if(nf.filter_special_marks(datum,valid_new)!=of.filter_special_marks(datum,valid_old)
+          ||valid_new!=valid_old) {std::printf("Filter mismatch\n");std::fflush(stdout);std::abort();}
+    }
+  }
+  ObDatum empty{nullptr,0};
+  nf.filter_special_marks(empty,valid_new);of.filter_special_marks(empty,valid_old);
+  if(valid_new!=valid_old) {std::printf("Empty filter mismatch\n");std::fflush(stdout);std::abort();}
+  std::printf("PASS: 262145 old/new token-filter comparisons (synthetic charset tables)\n");
   char b[4];
   for(ob_wc_t wc=0;wc<=0x10ffff;++wc) {
     if(wc>=0xd800 && wc<=0xdfff) continue;
@@ -114,9 +156,10 @@ int main() {
   std::printf("checksum=%lu\n",sum);
 }
 '''
-(o/'main.cpp').write_text(main)
+main = main.replace('int main() {', filters + '\nint main() {')
+(o/'main.cpp').write_text(main, encoding='utf-8')
 print('Generated component differential harness from actual old/new headers and production UTF-8 decoder/predicates.')
 
 
-subprocess.run([args.cxx, '-std=c++17', '-O2', str(o/'main.cpp'), str(o/'unicode.cpp'), '-o', str(o/'check')], check=True)
+subprocess.run([args.cxx] + (['c++'] if args.zig else []) + ['-std=c++17', '-O2', str(o/'main.cpp'), str(o/'unicode.cpp'), '-o', str(o/'check')], check=True)
 subprocess.run([str(o/'check')], check=True)
