@@ -19,3 +19,4 @@ target_link_libraries(ai_column_tests PRIVATE
   -static-libgcc
   -static-libstdc++)
 add_test(NAME ai_column_tests COMMAND ai_column_tests)
+add_custom_target(pretest DEPENDS ai_column_tests)

@@ -89,5 +89,19 @@ else
   set -e
 fi
 
+# The registered repository's workflow consumes this stable path. CMake's
+# production binary lives in build_<profile>/src/observer instead.
+if [[ "$compile_ret" -eq 0 && -f "$WORKSPACE/build.sh" ]]; then
+  BUILT_BINARY="$WORKSPACE/$BUILD_DIR/src/observer/seekdb"
+  if [[ ! -x "$BUILT_BINARY" ]]; then
+    echo "[compile.sh] expected executable missing: $BUILT_BINARY" >&2
+    exit 1
+  fi
+  PUBLISHED_BINARY="$WORKSPACE/build/bin/src/observer/seekdb"
+  mkdir -p "$(dirname "$PUBLISHED_BINARY")"
+  ln -sfn "$BUILT_BINARY" "$PUBLISHED_BINARY"
+  echo "[compile.sh] executable available at $PUBLISHED_BINARY"
+fi
+
 echo "[compile.sh] total elapsed=$((SECONDS - compile_start))s"
 exit "$compile_ret"

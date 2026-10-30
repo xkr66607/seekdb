@@ -76,3 +76,8 @@ cmake --build build_release --target ai_column_tests -j2
 SHOW CREATE 输出可直接重建、ADD COLUMN 为已有数据生成结果，以及含引号的
 复合主键和主键变更。对隔离测试实例执行 SIGKILL 后，重启验证已提交任务与
 READY NULL 状态仍存在，中断租约得到回收，任务能够继续完成并写回。
+
+再次复查提交的干净检出：`build.sh release` 配置成功，已跟踪的 `src` 与 `rust`
+内容与实测源码一致。补齐 `pretest` 聚合目标，并通过 CTest 运行原生测试。
+编译脚本在成功后将同一个数据库可执行文件发布到现有工作流要求的
+`build/bin/src/observer/seekdb`，同时保留 CMake 原有产物位置。
