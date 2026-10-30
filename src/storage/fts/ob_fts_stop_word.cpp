@@ -76,33 +76,41 @@ int ObStopWordChecker::check_stopword(const ObFTWord &word, bool &is_stopword)
   int ret = OB_SUCCESS;
   
   
-  common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
   if (OB_UNLIKELY(!inited_)) {
     ret = OB_NOT_INIT;
   } else if (OB_UNLIKELY(word.empty())) {
     ret = OB_INVALID_ARGUMENT;
   } else {
-    common::ObString cmp_str;
-    // do nothing set out with in if type is the same.
-    if (OB_FAIL(common::ObCharset::charset_convert(
+    const common::ObString &src_str = word.get_word().get_string();
+    ObFTWord converted;
+    if (common::ObCharset::charset_type_by_coll(word.get_collation_type())
+        == common::ObCharset::charset_type_by_coll(stopword_type_.get_collation_type())) {
+      // Same character set: only the collation tag differs, the bytes are identical.
+      // Reuse the input buffer instead of converting and copying on every token.
+      converted = ObFTWord(src_str.length(), src_str.ptr(), stopword_type_);
+      ret = stopword_set_.exist_refactored(converted);
+    } else {
+      common::ObArenaAllocator allocator(lib::ObMemAttr("ChkStopWord"));
+      common::ObString cmp_str;
+      if (OB_FAIL(common::ObCharset::charset_convert(
                                        allocator,
-                                       word.get_word().get_string(),
+                                       src_str,
                                        word.get_collation_type(),
                                        stopword_type_.get_collation_type(),
                                        cmp_str))) {
-    } else {
-      ObFTWord converted(cmp_str.length(), cmp_str.ptr(), stopword_type_);
-      ret = stopword_set_.exist_refactored(converted);
-      if (OB_HASH_NOT_EXIST == ret) {
-        is_stopword = false;
-        ret = OB_SUCCESS;
-      } else if (OB_HASH_EXIST == ret) {
-        is_stopword = true;
-        ret = OB_SUCCESS;
-      } else if (OB_SUCC(ret)) {
-        ret = OB_ERR_UNEXPECTED;
       } else {
+        converted = ObFTWord(cmp_str.length(), cmp_str.ptr(), stopword_type_);
+        ret = stopword_set_.exist_refactored(converted);
       }
+    }
+    if (OB_HASH_NOT_EXIST == ret) {
+      is_stopword = false;
+      ret = OB_SUCCESS;
+    } else if (OB_HASH_EXIST == ret) {
+      is_stopword = true;
+      ret = OB_SUCCESS;
+    } else if (OB_SUCC(ret)) {
+      ret = OB_ERR_UNEXPECTED;
     }
   }
   return ret;
@@ -158,11 +166,84 @@ bool ObAddWord::is_min_max_word(const int64_t c_len) const
   return flag_.min_max_word() && (c_len < min_token_size_ || c_len > max_token_size_);
 }
 
+
+namespace
+{
+// Byte length of the first UTF-8 code point, or 0 for malformed input.
+inline int64_t ob_ft_utf8_char_len(const unsigned char *p, const int64_t remain)
+{
+  if (remain <= 0) {
+    return 0;
+  }
+  const unsigned char c = p[0];
+  if (c < 0x80) {
+    return 1;
+  } else if ((c & 0xE0) == 0xC0) {
+    return (remain >= 2 && (p[1] & 0xC0) == 0x80) ? 2 : 0;
+  } else if ((c & 0xF0) == 0xE0) {
+    return (remain >= 3 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80) ? 3 : 0;
+  } else if ((c & 0xF8) == 0xF0) {
+    return (remain >= 4 && (p[1] & 0xC0) == 0x80 && (p[2] & 0xC0) == 0x80
+            && (p[3] & 0xC0) == 0x80) ? 4 : 0;
+  }
+  return 0;
+}
+
+inline uint32_t ob_ft_utf8_decode(const unsigned char *p, const int64_t len)
+{
+  switch (len) {
+    case 1: return static_cast<uint32_t>(p[0]);
+    case 2: return ((p[0] & 0x1F) << 6) | (p[1] & 0x3F);
+    case 3: return ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+    default: return ((p[0] & 0x07) << 18) | ((p[1] & 0x3F) << 12)
+                   | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+  }
+}
+
+// Code points in these blocks have no lowercase mapping, so casedn is identity.
+inline bool ob_ft_is_caseless_codepoint(const uint32_t cp)
+{
+  return (cp >= 0x3000 && cp <= 0x303F)     // CJK punctuation
+      || (cp >= 0x3040 && cp <= 0x30FF)     // Hiragana / Katakana
+      || (cp >= 0x3400 && cp <= 0x4DBF)     // CJK extension A
+      || (cp >= 0x4E00 && cp <= 0x9FFF)     // CJK unified ideographs
+      || (cp >= 0xAC00 && cp <= 0xD7A3)     // Hangul syllables
+      || (cp >= 0xF900 && cp <= 0xFAFF)     // CJK compatibility ideographs
+      || (cp >= 0x20000 && cp <= 0x2FA1F);  // CJK extensions B-F and supplement
+}
+
+inline bool ob_ft_is_caseless_word(const common::ObString &word)
+{
+  const unsigned char *p = reinterpret_cast<const unsigned char *>(word.ptr());
+  int64_t remain = word.length();
+  while (remain > 0) {
+    const int64_t char_len = ob_ft_utf8_char_len(p, remain);
+    if (0 == char_len) {
+      return false;
+    }
+    const uint32_t cp = ob_ft_utf8_decode(p, char_len);
+    if (cp >= 'A' && cp <= 'Z') {
+      return false;
+    }
+    if (cp >= 0x80 && !ob_ft_is_caseless_codepoint(cp)) {
+      return false;
+    }
+    p += char_len;
+    remain -= char_len;
+  }
+  return true;
+}
+} // namespace
+
 int ObAddWord::casedown_word(const ObFTWord &src, ObFTWord &dst)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(src.empty())) {
     ret = OB_INVALID_ARGUMENT;
+  } else if (flag_.casedown() && ob_ft_is_caseless_word(src.get_word().get_string())) {
+    // CJK, digits and punctuation have no case mapping.  Taking this path also
+    // avoids a per-token allocation and copy in ObCharset::tolower.
+    dst = src;
   } else if (flag_.casedown()) {
     ObString dst_str;
     if (OB_FAIL(ObCharset::tolower(

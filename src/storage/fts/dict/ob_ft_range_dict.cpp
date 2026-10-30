@@ -37,12 +37,43 @@
 #include "storage/fts/dict/ob_ft_dict_table_iter.h"
 #include "storage/fts/dict/ob_ft_trie.h"
 
+#include <cstdint>
+
 #define USING_LOG_PREFIX STORAGE_FTS
 
 namespace oceanbase
 {
 namespace storage
 {
+namespace
+{
+constexpr uint32_t INVALID_CODEPOINT = static_cast<uint32_t>(-1);
+
+// Decode the first UTF-8 code point.  Dictionary ranges are UTF8MB4 only and
+// are split exactly on first-character boundaries, so comparing this value is
+// equivalent to comparing the full range bounds under a binary collation.
+inline int ob_ft_first_utf8_codepoint(const common::ObString &word, uint32_t &cp)
+{
+  int ret = OB_SUCCESS;
+  const unsigned char *p = reinterpret_cast<const unsigned char *>(word.ptr());
+  const int64_t len = word.length();
+  if (OB_ISNULL(p) || len <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (p[0] < 0x80) {
+    cp = p[0];
+  } else if ((p[0] & 0xE0) == 0xC0 && len >= 2) {
+    cp = ((p[0] & 0x1F) << 6) | (p[1] & 0x3F);
+  } else if ((p[0] & 0xF0) == 0xE0 && len >= 3) {
+    cp = ((p[0] & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+  } else if ((p[0] & 0xF8) == 0xF0 && len >= 4) {
+    cp = ((p[0] & 0x07) << 18) | ((p[1] & 0x3F) << 12)
+         | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+  } else {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  return ret;
+}
+} // namespace
 
 
 int ObFTRangeDict::build_cache_from_ik_dict(const ObFTDictDesc &desc, ObFTCacheRangeContainer &range_container)
@@ -378,20 +409,34 @@ int ObFTRangeDict::match_with_hit(const ObString &single_word,
   return last_hit.dict_->match_with_hit(single_word, last_hit, hit);
 }
 
+int ObFTRangeDict::first_codepoint(const ObString &word, uint32_t &cp)
+{
+  return ob_ft_first_utf8_codepoint(word, cp);
+}
+
 int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict *&dict) const
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
+  uint32_t cp = 0;
+  const bool cp_ready = (OB_SUCCESS == first_codepoint(single_word, cp));
+  for (int i = 0; !found && i < range_dicts_.size(); ++i) {
+    const ObFTRange &range = range_dicts_[i];
+    bool in_range = false;
+    if (cp_ready && INVALID_CODEPOINT != range.start_cp_ && INVALID_CODEPOINT != range.end_cp_) {
+      in_range = (cp >= range.start_cp_ && cp <= range.end_cp_);
+    } else {
+      in_range = ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                   range.start_.get_word(),
+                                   single_word)
+                     <= 0
+                 && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
+                                      range.end_.get_word(),
+                                      single_word)
+                        >= 0;
+    }
+    if (in_range) {
+      dict = range.dict_;
       found = true;
     }
   }
@@ -418,6 +463,15 @@ int ObFTRangeDict::build_dict_from_cache(const ObFTCacheRangeContainer &range_co
       range.start_ = dat->start_word_;
       range.end_ = dat->end_word_;
       range.dict_ = dict;
+      range.start_cp_ = 0;
+      range.end_cp_ = 0;
+      if (OB_FAIL(first_codepoint(range.start_.get_word(), range.start_cp_))
+          || OB_FAIL(first_codepoint(range.end_.get_word(), range.end_cp_))) {
+        // Fall back to string comparison for this range.
+        range.start_cp_ = INVALID_CODEPOINT;
+        range.end_cp_ = INVALID_CODEPOINT;
+        ret = OB_SUCCESS;
+      }
       if (OB_FAIL(range_dicts_.push_back(range))) {
       }
     }

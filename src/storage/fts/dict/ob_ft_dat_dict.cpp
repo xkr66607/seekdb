@@ -302,15 +302,16 @@ ObArrayHashMap *ObFTDAT::get_map() { return reinterpret_cast<ObArrayHashMap *>(b
 int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
 {
   int ret = OB_ENTRY_NOT_EXIST;
+  const uint64_t mask = header_.capacity_ - 1;
   uint64_t hash = word.get_word().hash();
-  uint64_t index = hash % header_.capacity_;
+  uint64_t index = hash & mask;
   while (header_.data[index].used) {
     if (header_.data[index].word == word) {
       code = header_.data[index].code;
       ret = OB_SUCCESS;
       break;
     } else {
-      index = (index + 3) % header_.capacity_;
+      index = (index + 3) & mask;
     }
   }
   return ret;
@@ -319,10 +320,11 @@ int ObArrayHashMap::find(const ObFTSingleWord &word, ObFTWordCode &code) const
 int ObArrayHashMap::insert(const ObString &key, ObFTWordCode code)
 {
   int ret = OB_SUCCESS;
+  const uint64_t mask = header_.capacity_ - 1;
   uint64_t hash = key.hash();
-  uint64_t index = hash % header_.capacity_;
+  uint64_t index = hash & mask;
   while (header_.data[index].used) {
-    index = (index + 3) % header_.capacity_;
+    index = (index + 3) & mask;
   }
 
   header_.data[index].code = code;
@@ -354,8 +356,13 @@ size_t ObArrayHashMap::estimate_size(size_t word_num)
 
 size_t ObArrayHashMap::estimate_capacity(size_t word_num)
 {
-  constexpr size_t MIN_CAPACITY = 101;                   // prime
-  size_t capacity = MAX(word_num * 4 / 3, MIN_CAPACITY); // 75%
+  constexpr size_t MIN_CAPACITY = 128;
+  // Power-of-two capacity lets lookups replace a division with a mask.
+  size_t needed = MAX(word_num * 4 / 3, MIN_CAPACITY); // <= 75% load
+  size_t capacity = MIN_CAPACITY;
+  while (capacity < needed) {
+    capacity <<= 1;
+  }
   return capacity;
 }
 } //  namespace storage

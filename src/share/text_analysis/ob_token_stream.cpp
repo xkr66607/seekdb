@@ -207,14 +207,16 @@ int ObTokenStopWordNormalizer::filter_special_marks(const ObDatum &check_token, 
   int ret = OB_SUCCESS;
   const int64_t token_len = check_token.len_;
   const char *token = check_token.ptr_;
-  int64_t special_mark_cnt = 0;
+  is_valid = false;
   for (int64_t i = 0; i < token_len; ++i) {
     const char *character = token + i;
-    if (ob_ispunct(cs_, *character) || ob_iscntrl(cs_, *character)) {
-      special_mark_cnt++;
+    if (!ob_ispunct(cs_, *character) && !ob_iscntrl(cs_, *character)) {
+      // One ordinary byte is sufficient to retain the token. Keep the
+      // existing charset predicates, including their handling of high bytes.
+      is_valid = true;
+      break;
     }
   }
-  is_valid = !(special_mark_cnt == token_len);
   return ret;
 }
 
