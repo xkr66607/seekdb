@@ -7767,6 +7767,12 @@ int ObDDLService::add_new_column_to_table_schema(
       LOG_USER_ERROR(OB_OP_NOT_ALLOW, "inner table add column without column_id");
     } else {
       alter_column_schema.set_column_id(++max_used_column_id);
+      if (alter_column_schema.is_ai_column()) {
+        const uint64_t state = ++max_used_column_id;
+        const uint64_t request = ++max_used_column_id;
+        const uint64_t spec = ++max_used_column_id;
+        alter_column_schema.set_ai_hidden_column_ids(state,request,spec);
+      }
       alter_column_schema.set_rowkey_position(0);
       alter_column_schema.set_index_position(0);
       alter_column_schema.set_not_part_key();
@@ -7828,6 +7834,30 @@ int ObDDLService::add_new_column_to_table_schema(
         if (OB_FAIL(ddl_operator->insert_single_column(*trans,
                 new_table_schema, alter_column_schema))) {
         }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && alter_column_schema.is_ai_column()) {
+    const uint64_t ids[] = {alter_column_schema.get_ai_state_column_id(),
+        alter_column_schema.get_ai_request_column_id(),alter_column_schema.get_ai_result_spec_column_id()};
+    const char *suffix[] = {"state","request","spec"};
+    for (int64_t i = 0; OB_SUCC(ret) && i < 3; ++i) {
+      AlterColumnSchema hidden;
+      ObSqlString name;
+      hidden.alter_type_ = OB_DDL_ADD_COLUMN;
+      hidden.set_table_id(new_table_schema.get_table_id());
+      hidden.set_column_id(ids[i]);
+      hidden.set_is_hidden(true);
+      hidden.set_nullable(true);
+      hidden.set_data_type(i == 0 ? ObTinyIntType : ObVarcharType);
+      hidden.set_data_length(i == 0 ? 1 : 64);
+      hidden.set_collation_type(i == 0 ? CS_TYPE_BINARY : CS_TYPE_UTF8MB4_BIN);
+      if (OB_FAIL(name.append_fmt("__ai_%lu_%s",alter_column_schema.get_column_id(),suffix[i]))) {
+      } else if (OB_FAIL(hidden.set_column_name(name.string()))) {
+      } else if (OB_FAIL(update_prev_id_and_add_column_(origin_table_schema,new_table_schema,hidden,ddl_operator,trans))) {
+      } else if (update_inner_table) {
+        ret = ddl_operator->insert_single_column(*trans,new_table_schema,hidden);
       }
     }
   }

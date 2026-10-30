@@ -896,6 +896,13 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
       }
     }
 
+    if (OB_SUCC(ret) && RESOLVE_NON_COL != resolve_rule) {
+      table_schema.set_max_used_column_id(cur_column_id_);
+      if (OB_SUCC(ret = finalize_ai_columns(table_schema, node))) {
+        cur_column_id_ = table_schema.get_max_used_column_id();
+      }
+    }
+
     // A table must have at least one column as a visible column
     if (OB_SUCC(ret)) {
       // RESOLVE_NON_COL == resolve_rule when, only parse non-column definitions

@@ -68,6 +68,7 @@ public:
   static const int64_t EXPIRED_PLAN_TABLE_ROW_THRESHOLD = 100;
   OB_UNIS_VERSION(1);
 public:
+  common::ObSEArray<uint64_t, 8> ai_column_refs_;
   explicit ObPhysicalPlan(lib::MemoryContext &mem_context = CURRENT_CONTEXT);
   virtual ~ObPhysicalPlan();
 

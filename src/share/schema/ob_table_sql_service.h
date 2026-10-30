@@ -552,6 +552,7 @@ private:
       const int64_t schema_version);
 
 public:
+  int add_ai_column(common::ObISQLClient &client, const ObColumnSchemaV2 &column);
   void init(common::ObMySQLProxy *sql_proxy) { sql_proxy_ = sql_proxy; }
 private:
   common::ObMySQLProxy *sql_proxy_;

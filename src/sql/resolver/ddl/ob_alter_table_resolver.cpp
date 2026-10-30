@@ -148,6 +148,35 @@ int ObAlterTableResolver::resolve(const ParseNode &parse_tree)
       alter_table_stmt->get_alter_table_arg().alter_table_schema_.set_charset_type(table_schema_->get_charset_type());
       alter_table_stmt->get_alter_table_arg().alter_table_schema_.set_collation_type(table_schema_->get_collation_type());
     }
+    // RETRY is a data operation with one target, not a mixed schema change.
+    if (OB_SUCC(ret) && parse_tree.children_[ACTION_LIST] != NULL) {
+      const ParseNode *actions = parse_tree.children_[ACTION_LIST];
+      for (int64_t a = 0; a < actions->num_child_; ++a) {
+        const ParseNode *action = actions->children_[a];
+        if (action != NULL && action->type_ == T_AI_COLUMN_RETRY) {
+          if (actions->num_child_ != 1) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED,"combining AI COLUMN RETRY with another ALTER action");
+          } else {
+            const ParseNode *name = action->children_[0];
+            const ObString column_name(name->str_len_,name->str_value_);
+            const ObColumnSchemaV2 *column = table_schema_->get_column_schema(column_name);
+            if (column == NULL || !column->is_ai_column()) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED,"retrying a column that is not an AI column");
+            } else {
+              ret = ob_write_string(*allocator_,column_name,alter_table_stmt->ai_retry_column_);
+              const ParseNode *where = action->children_[1];
+              if (OB_SUCC(ret) && where != NULL) {
+                ret = ob_write_string(*allocator_,ObString(where->str_len_,where->str_value_),
+                                      alter_table_stmt->ai_retry_predicate_);
+              }
+            }
+          }
+          return ret;
+        }
+      }
+    }
     //resolve action list
     if (OB_SUCCESS == ret && NULL != parse_tree.children_[ACTION_LIST]){
       if (OB_FAIL(resolve_action_list(*(parse_tree.children_[ACTION_LIST])))) {
@@ -3422,6 +3451,8 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
                                                           is_modify_column_visibility,
                                                           resolved_cols,
                                                           false))) {
+        } else if (alter_column_schema.is_ai_column() &&
+                   OB_FAIL(bind_ai_column_dependencies(alter_column_schema,node.children_[i],*table_schema_))) {
         } else if (OB_FAIL(fill_column_schema_according_stat(stat, alter_column_schema))) {
         } else if (OB_FAIL(set_column_collation(alter_column_schema))) {
         }
@@ -4053,10 +4084,19 @@ int ObAlterTableResolver::resolve_modify_column(const ParseNode &node,
                     resolved_cols,
                     false,
                     allow_has_default))) {
+        } else if (alter_column_schema.is_ai_column()!=origin_col_schema->is_ai_column()) {
+          ret=OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED,"adding or removing AI generation through MODIFY; use ADD COLUMN");
+        } else if (alter_column_schema.is_ai_column() &&
+                   OB_FAIL(bind_ai_column_dependencies(alter_column_schema,node.children_[i],*table_schema_))) {
         } else if (!stat.is_primary_key_ &&
                    OB_FAIL(resolve_alter_column_not_null(alter_column_schema, *origin_col_schema))) {
         }
         if (OB_SUCC(ret)) {
+          if (alter_column_schema.is_ai_column()) {
+            alter_column_schema.set_ai_hidden_column_ids(origin_col_schema->get_ai_state_column_id(),
+                origin_col_schema->get_ai_request_column_id(),origin_col_schema->get_ai_result_spec_column_id());
+          }
           alter_column_schema.is_primary_key_ = stat.is_primary_key_;
           alter_column_schema.is_unique_key_ = stat.is_unique_key_;
           alter_column_schema.is_autoincrement_ = stat.is_autoincrement_;

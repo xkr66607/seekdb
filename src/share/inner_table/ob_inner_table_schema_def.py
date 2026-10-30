@@ -342,7 +342,8 @@ all_column_def = dict(
       ('sub_data_type', 'int', 'false', '0'),
       ('skip_index_attr', 'int', 'false', '0'),
       ('lob_chunk_size', 'int', 'false', 'OB_DEFAULT_LOB_CHUNK_SIZE'),
-      ('local_session_vars', 'longtext', 'true')
+      ('local_session_vars', 'longtext', 'true'),
+      ('ai_column_info', 'varbinary:OB_MAX_VARBINARY_LENGTH', 'true')
   ]
   )
 
@@ -2446,6 +2447,40 @@ all_ai_model_endpoint_def = dict(
 )
 def_table_schema(**all_ai_model_endpoint_def)
 
+
+# Async AI definitions and the durable transaction outbox. Result staging is kept
+# in the task row so a worker restart cannot publish half of a generation group.
+def_table_schema(
+    owner = 'ai_column', table_name = '__all_ai_column', table_id = '1131',
+    table_type = 'SYSTEM_TABLE', gm_columns = ['gmt_create', 'gmt_modified'],
+    is_cluster_private = False, meta_record_in_sys = False,
+    rowkey_columns = [('table_id', 'int'), ('column_id', 'int')],
+    normal_columns = [
+        ('column_name', 'varchar:128', 'false'),
+        ('definition_version', 'int', 'false', '0'),
+        ('normalized_expr', 'longtext', 'false', ''),
+        ('max_retries', 'int', 'false', '2'),
+        ('state_column_id', 'int', 'false', '0'),
+        ('request_column_id', 'int', 'false', '0'),
+        ('result_spec_column_id', 'int', 'false', '0'),
+        ('dependency_ids', 'varchar:4096', 'false', '')])
+
+def_table_schema(
+    owner = 'ai_column', table_name = '__all_ai_column_task', table_id = '1132',
+    table_type = 'SYSTEM_TABLE', gm_columns = ['gmt_create', 'gmt_modified'],
+    is_cluster_private = False, meta_record_in_sys = False,
+    rowkey_columns = [('table_id', 'int'), ('request_id', 'varchar:64'), ('column_id', 'int')],
+    normal_columns = [
+        ('definition_version', 'int', 'false', '0'),
+        ('rowkey_predicate', 'varchar:4096', 'false', ''),
+        ('eligible_ts', 'timestamp', 'true'),
+        ('attempts', 'int', 'false', '0'),
+        ('retry_count', 'int', 'false', '0'),
+        ('lease_owner', 'varchar:64', 'false', ''),
+        ('lease_until', 'timestamp', 'true'),
+        ('state', 'int', 'false', '0'),
+        ('result', 'longtext', 'true'),
+        ('error_code', 'int', 'false', '0')])
 
 all_objauth_mysql_def = dict(
     owner = 'cjl476581',

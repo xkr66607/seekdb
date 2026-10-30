@@ -970,6 +970,18 @@ int ObOptimizer::check_whether_contain_nested_sql(const ObDMLStmt &stmt)
       } else if (!table_schema->get_foreign_key_infos().empty()) {
         ctx_.set_has_fk(true);
       }
+      if (OB_SUCC(ret) && table_schema != nullptr && session->is_user_session()) {
+        for(int64_t c=0;c<table_schema->get_column_count();++c) {
+          if(table_schema->get_column_schema_by_idx(c)->is_ai_column()) {
+            // The transactional outbox executes nested SQL. It needs the same
+            // snapshot and serial DML safeguards as other nested SQL writers.
+            stmt.get_query_ctx()->set_has_nested_sql(true);
+            stmt.get_query_ctx()->disable_udf_parallel_=true;
+            ctx_.set_has_pl_udf(true);
+            break;
+          }
+        }
+      }
       if (OB_SUCC(ret)) {
         if (OB_FAIL(table_schema->check_has_trigger_on_table(*schema_guard,
                                                              trigger_exists,

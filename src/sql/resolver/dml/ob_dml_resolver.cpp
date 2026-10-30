@@ -3088,6 +3088,21 @@ int ObDMLResolver::resolve_single_table_column_item(const TableItem &table_item,
       ret = OB_ERR_BAD_FIELD_ERROR;
     }
   }
+
+  if (OB_SUCC(ret) && !include_hidden && table_item.is_basic_table() && col_item != NULL) {
+    const ObTableSchema *schema = NULL;
+    if (OB_SUCC(ret = schema_checker_->get_table_schema(table_item.ref_id_,schema)) && schema != NULL) {
+      const ObColumnSchemaV2 *column = schema->get_column_schema(col_item->column_id_);
+      if (column != NULL && column->is_ai_column()) {
+        ObIArray<uint64_t> &refs = stmt->get_query_ctx()->ai_column_refs_;
+        bool found = false;
+        for (int64_t i = 0; i + 1 < refs.count(); i += 2) {
+          found |= refs.at(i)==schema->get_table_id() && refs.at(i+1)==column->get_column_id();
+        }
+        if (!found && OB_SUCC(ret = refs.push_back(schema->get_table_id()))) { ret = refs.push_back(column->get_column_id()); }
+      }
+    }
+  }
   return ret;
 }
 
@@ -5003,6 +5018,9 @@ int ObDMLResolver::resolve_all_basic_table_columns(const TableItem &table_item, 
                                                      include_hidden, col_item))) {
         } else if (column_items != NULL) {
           if (OB_FAIL(column_items->push_back(*col_item))) {
+            } else if (!include_hidden && column_schema->is_ai_column()) {
+              ObIArray<uint64_t> &refs=stmt->get_query_ctx()->ai_column_refs_;
+              if (OB_SUCC(ret=refs.push_back(table_schema->get_table_id()))) {ret=refs.push_back(column_schema->get_column_id());}
           }
         }
       }
@@ -5706,6 +5724,15 @@ int ObDMLResolver::check_basic_column_generated(const ObColumnRefRawExpr *col_ex
       ret = OB_ERR_UNEXPECTED;
     } else if (basic_column_item->expr_->is_generated_column()) {
       is_generated = true;
+    }
+  }
+
+  if (OB_SUCC(ret) && session_info_ != NULL && session_info_->is_user_session() &&
+      table_item != NULL && table_item->is_basic_table()) {
+    const ObTableSchema *schema = NULL;
+    if (OB_SUCC(ret = schema_checker_->get_table_schema(table_item->ref_id_,schema)) && schema != NULL) {
+      const ObColumnSchemaV2 *column = schema->get_column_schema(col_expr->get_column_id());
+      is_generated |= column != NULL && column->is_ai_column();
     }
   }
   return ret;

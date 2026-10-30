@@ -42,6 +42,8 @@
 
 #include "sql/printer/ob_select_stmt_printer.h"
 #include "share/ob_structured_event_logger.h"
+#include "sql/engine/expr/ob_expr_uuid.h"
+#include "common/mysqlclient/ob_mysql_transaction.h"
 namespace oceanbase
 {
 using namespace common;
@@ -751,8 +753,136 @@ int ObAlterTableExecutor::alter_table_exchange_partition_rpc(obcall::ObExchangeP
   return ret;
 }
 
+
+static int retry_ai_ident(ObSqlString &sql,const ObString &name)
+{
+  int ret=sql.append("`");
+  for(int64_t i=0;OB_SUCC(ret)&&i<name.length();++i){
+    ret=sql.append(name.ptr()+i,1);
+    if(OB_SUCC(ret)&&name.ptr()[i]=='`'){ret=sql.append("`");}
+  }
+  if(OB_SUCC(ret)){ret=sql.append("`");}return ret;
+}
+static int retry_ai_hex(ObSqlString &sql,const ObString &value)
+{
+  int ret=sql.append("X'");
+  for(int64_t i=0;OB_SUCC(ret)&&i<value.length();++i){ret=sql.append_fmt("%02x",static_cast<unsigned char>(value.ptr()[i]));}
+  if(OB_SUCC(ret)){ret=sql.append("'");}return ret;
+}
+static bool retry_ai_word(unsigned char c)
+{return (c>='a'&&c<='z')||(c>='A'&&c<='Z')||(c>='0'&&c<='9')||c=='_'||c=='$'||c>=128;}
+
+// Rewrite only the retry pseudo column. Quoted identifiers, SQL strings, and
+// comments are copied intact, so `status` still names a business column.
+static int retry_ai_filter(const ObString &predicate,const ObString &state_name,ObSqlString &sql)
+{
+  int ret=OB_SUCCESS;
+  for(int64_t i=0;OB_SUCC(ret)&&i<predicate.length();){
+    const char c=predicate.ptr()[i];
+    int64_t end=i+1;
+    if(c=='\''||c=='"'||c=='`'){
+      while(end<predicate.length()){
+        const char next=predicate.ptr()[end++];
+        if(next=='\\'&&c!='`'&&end<predicate.length()){++end;}
+        else if(next==c){if(end<predicate.length()&&predicate.ptr()[end]==c){++end;}else{break;}}
+      }
+    }else if(c=='/'&&end<predicate.length()&&predicate.ptr()[end]=='*'){
+      ++end;while(end+1<predicate.length()&&!(predicate.ptr()[end]=='*'&&predicate.ptr()[end+1]=='/')){++end;}
+      end=std::min<int64_t>(predicate.length(),end+2);
+    }else if(c=='#'||(c=='-'&&end<predicate.length()&&predicate.ptr()[end]=='-')){
+      while(end<predicate.length()&&predicate.ptr()[end]!='\n'){++end;}
+    }else if(retry_ai_word(c)){
+      while(end<predicate.length()&&retry_ai_word(predicate.ptr()[end])){++end;}
+      if(ObString(end-i,predicate.ptr()+i).case_compare("status")==0){
+        if(OB_SUCC(ret=sql.append("(CASE COALESCE("))&&OB_SUCC(ret=retry_ai_ident(sql,state_name))){
+          ret=sql.append(",0) WHEN 1 THEN 'READY' WHEN 2 THEN 'FAILED' ELSE 'PENDING' END)");
+        }
+        i=end;continue;
+      }
+    }
+    ret=sql.append(predicate.ptr()+i,end-i);i=end;
+  }
+  return ret;
+}
+
+static int execute_ai_retry(ObExecContext &ctx,ObAlterTableStmt &stmt)
+{
+  int ret=OB_SUCCESS;
+  const ObTableSchema *table=NULL;
+  const ObColumnSchemaV2 *column=NULL;
+  ObSchemaGetterGuard guard;
+  if(GCTX.schema_service_==NULL){return OB_NOT_INIT;}
+  if(OB_FAIL(GCTX.schema_service_->get_runtime_schema_guard(guard))){return ret;}
+  if(OB_FAIL(guard.get_table_schema(stmt.get_alter_table_schema().get_table_id(),table))){return ret;}
+  if(table==NULL||(column=table->get_column_schema(stmt.ai_retry_column_))==NULL||!column->is_ai_column()){return OB_SCHEMA_EAGAIN;}
+  const ObColumnSchemaV2 *state=table->get_column_schema(column->get_ai_state_column_id());
+  const ObColumnSchemaV2 *request_column=table->get_column_schema(column->get_ai_request_column_id());
+  const ObColumnSchemaV2 *spec=table->get_column_schema(column->get_ai_result_spec_column_id());
+  if(state==NULL||request_column==NULL||spec==NULL){return OB_SCHEMA_EAGAIN;}
+  ObSqlString qualified;
+  if(OB_SUCC(ret=retry_ai_ident(qualified,stmt.get_org_database_name()))&&OB_SUCC(ret=qualified.append("."))){ret=retry_ai_ident(qualified,stmt.get_org_table_name());}
+  ObSqlString select;
+  if(OB_SUCC(ret)){ret=select.append("SELECT ");}
+  for(int64_t i=0;OB_SUCC(ret)&&i<table->get_rowkey_column_num();++i){
+    if(i>0){ret=select.append(",");}
+    if(OB_SUCC(ret)){ret=retry_ai_ident(select,table->get_column_schema(table->get_rowkey_info().get_column(i)->column_id_)->get_column_name_str());}
+  }
+  if(OB_SUCC(ret)){ret=select.append_fmt(" FROM %s",qualified.ptr());}
+  if(OB_SUCC(ret)&&!stmt.ai_retry_predicate_.empty()){
+    if(OB_SUCC(ret=select.append(" WHERE "))){ret=retry_ai_filter(stmt.ai_retry_predicate_,state->get_column_name_str(),select);}
+  }
+  if(OB_SUCC(ret)){ret=select.append(" FOR UPDATE");}
+  ObMySQLTransaction trans;
+  if(OB_SUCC(ret)){ret=trans.start(ctx.get_sql_proxy());}
+  ObSEArray<ObString,16> predicates;
+  if(OB_SUCC(ret)){
+    ObMySQLProxy::MySQLResult result;
+    if(OB_SUCC(ret=trans.read(result,select.ptr()))){
+      while(OB_SUCC(ret)&&OB_SUCC(ret=result.get_result()->next())){
+        ObSqlString key;
+        for(int64_t i=0;OB_SUCC(ret)&&i<table->get_rowkey_column_num();++i){
+          ObObj value;
+          if(OB_FAIL(result.get_result()->get_obj(i,value,NULL,&ctx.get_allocator()))){break;}
+          if(i>0){ret=key.append(" AND ");}
+          if(OB_SUCC(ret)){ret=retry_ai_ident(key,table->get_column_schema(table->get_rowkey_info().get_column(i)->column_id_)->get_column_name_str());}
+          if(OB_SUCC(ret)){ret=key.append(" = ");}
+          if(OB_SUCC(ret)&&value.is_string_type()){ret=retry_ai_hex(key,value.get_string());}
+          else if(OB_SUCC(ret)){
+            char *buf=NULL;int64_t len=0,pos=0;
+            if(OB_SUCC(ret=value.print_sql_literal(buf,len,pos,ctx.get_allocator()))){ret=key.append(buf,pos);}
+          }
+        }
+        ObString copy;
+        if(OB_SUCC(ret)&&OB_SUCC(ret=ob_write_string(ctx.get_allocator(),key.string(),copy))){ret=predicates.push_back(copy);}
+      }
+      if(ret==OB_ITER_END){ret=OB_SUCCESS;}
+    }
+  }
+  for(int64_t i=0;OB_SUCC(ret)&&i<predicates.count();++i){
+    char request[UuidCommon::LENGTH_UUID+1]={0};
+    ObSqlString sql;int64_t affected=0;
+    if(OB_SUCC(ret=ObExprUuid::gen_server_uuid(request,UuidCommon::LENGTH_UUID))&&
+       OB_SUCC(ret=sql.append_fmt("DELETE FROM oceanbase.__all_ai_column_task WHERE table_id=%lu AND column_id=%lu AND rowkey_predicate=",table->get_table_id(),column->get_column_id()))&&
+       OB_SUCC(ret=retry_ai_hex(sql,predicates.at(i)))){ret=trans.write(sql.ptr(),affected);}
+    sql.reset();
+    if(OB_SUCC(ret)&&OB_SUCC(ret=sql.append_fmt("UPDATE %s SET ",qualified.ptr()))&&
+       OB_SUCC(ret=retry_ai_ident(sql,column->get_column_name_str()))&&
+       OB_SUCC(ret=sql.append("=NULL,"))&&OB_SUCC(ret=retry_ai_ident(sql,state->get_column_name_str()))&&
+       OB_SUCC(ret=sql.append("=0,"))&&OB_SUCC(ret=retry_ai_ident(sql,request_column->get_column_name_str()))&&
+       OB_SUCC(ret=sql.append_fmt("='%s',",request))&&OB_SUCC(ret=retry_ai_ident(sql,spec->get_column_name_str()))&&
+       OB_SUCC(ret=sql.append_fmt("='%ld' WHERE %.*s",column->get_ai_definition_version(),predicates.at(i).length(),predicates.at(i).ptr()))){ret=trans.write(sql.ptr(),affected);}
+    sql.reset();
+    if(OB_SUCC(ret)&&OB_SUCC(ret=sql.append_fmt("INSERT INTO oceanbase.__all_ai_column_task(table_id,column_id,request_id,definition_version,rowkey_predicate,eligible_ts) VALUES(%lu,%lu,'%s',%ld,",
+       table->get_table_id(),column->get_column_id(),request,column->get_ai_definition_version()))&&
+       OB_SUCC(ret=retry_ai_hex(sql,predicates.at(i)))&&OB_SUCC(ret=sql.append(",now(6))"))){ret=trans.write(sql.ptr(),affected);}
+  }
+  if(trans.is_started()){const int end_ret=trans.end(OB_SUCC(ret));if(OB_SUCC(ret)){ret=end_ret;}}
+  return ret;
+}
+
 int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
 {
+  if (stmt.is_ai_column_retry()) { return execute_ai_retry(ctx,stmt); }
   int ret = OB_SUCCESS;
   ObSqlExecutorCtx *task_exec_ctx = NULL;
   obcall::ObAlterTableArg &alter_table_arg = stmt.get_alter_table_arg();

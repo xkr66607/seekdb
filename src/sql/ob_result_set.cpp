@@ -27,6 +27,8 @@
 #include "sql/monitor/show_trace/ob_show_trace.h"
 #include "sql/engine/table/ob_table_scan_op.h"
 #include "share/ob_ddl_checksum.h"
+#include "query/session/ob_inner_sql_connection_access.h"
+#include "sql/session/ob_inner_sql_connection.h"
 
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -190,6 +192,69 @@ int ObResultSet::open()
   return ret;
 }
 
+
+static int check_ai_strict_columns(ObPhysicalPlan &plan, ObSQLSessionInfo &session,
+                                   ObExecContext &ctx)
+{
+  int ret = OB_SUCCESS;
+  if (!session.is_user_session() || plan.ai_column_refs_.empty()) { return ret; }
+  ObObj strict;
+  if (OB_FAIL(session.get_sys_variable_by_name(ObString("ai_column_strict_read"),strict))) { return ret; }
+  if (strict.get_int() == 0) { return ret; }
+  oceanbase::common::sqlclient::ObISQLConnectionGuard connection;
+  if (OB_FAIL(oceanbase::query::ObInnerSQLConnectionAccess::create_spi_connection_with_external_session(&session,connection))) { return ret; }
+  ObIInnerSQLConnection *inner = as_inner_sql_connection(connection.get_ptr());
+  if (inner == NULL) { return OB_ERR_UNEXPECTED; }
+  ObSQLSessionInfo::StmtSavedValue saved_session;
+  ObIInnerSQLConnection::SavedValue saved_connection;
+  bool nested = false;
+  if (OB_SUCC(ret = inner->begin_nested_session(saved_session,saved_connection,true))) { nested = true; }
+  for (int64_t i = 0; OB_SUCC(ret) && i + 1 < plan.ai_column_refs_.count(); i += 2) {
+    const uint64_t tid=plan.ai_column_refs_.at(i), cid=plan.ai_column_refs_.at(i+1);
+    const ObTableSchema *table = NULL;
+    const ObDatabaseSchema *db = NULL;
+    ObSchemaGetterGuard *guard = ctx.get_sql_ctx()->schema_guard_;
+    if (OB_FAIL(guard->get_table_schema(tid,table))) {
+    } else if (table == NULL || table->get_column_schema(cid) == NULL) { ret = OB_SCHEMA_EAGAIN; }
+    else if (OB_FAIL(guard->get_database_schema(table->get_database_id(),db))) {
+    } else if (db == NULL) { ret = OB_SCHEMA_EAGAIN; }
+    else {
+      ObSqlString sql;
+      const ObColumnSchemaV2 *state=table->get_column_schema(table->get_column_schema(cid)->get_ai_state_column_id());
+      if(state==NULL){ret=OB_SCHEMA_EAGAIN;break;}
+      ObSqlString state_identifier;
+      ret=state_identifier.append("`");
+      const ObString &state_name=state->get_column_name_str();
+      for(int64_t c=0;OB_SUCC(ret)&&c<state_name.length();++c){
+        ret=state_identifier.append(state_name.ptr()+c,1);
+        if(OB_SUCC(ret)&&state_name.ptr()[c]=='`'){ret=state_identifier.append("`");}
+      }
+      if(OB_SUCC(ret)){ret=state_identifier.append("`");}
+      if(OB_FAIL(ret)){break;}
+      ret = sql.append("SELECT 1 FROM ");
+      const ObString names[] = {db->get_database_name_str(),table->get_table_name_str()};
+      for (int64_t n = 0; OB_SUCC(ret) && n < 2; ++n) {
+        if (n>0) { ret=sql.append("."); }
+        if (OB_SUCC(ret)) { ret=sql.append("`"); }
+        for (int64_t c=0; OB_SUCC(ret) && c<names[n].length(); ++c) {
+          ret=sql.append(names[n].ptr()+c,1);
+          if (OB_SUCC(ret) && names[n].ptr()[c]=='`') {ret=sql.append("`");}
+        }
+        if (OB_SUCC(ret)) {ret=sql.append("`");}
+      }
+      if (OB_SUCC(ret)) {ret=sql.append_fmt(" WHERE %s IS NULL OR %s<>1 LIMIT 1",state_identifier.ptr(),state_identifier.ptr());}
+      ObMySQLProxy::MySQLResult result;
+      if (OB_SUCC(ret) && OB_SUCC(ret=inner->execute_read(sql.string(),result))) {
+        ret=result.get_result()->next();
+        if (ret==OB_ITER_END) {ret=OB_SUCCESS;}
+        else if (OB_SUCC(ret)) {ret=OB_AI_COLUMN_NOT_READY; LOG_USER_ERROR(OB_AI_COLUMN_NOT_READY,tid,cid);}
+      }
+    }
+  }
+  if (nested) {const int end_ret=inner->end_nested_session(saved_session,saved_connection);if(OB_SUCC(ret)){ret=end_ret;}}
+  return ret;
+}
+
 int ObResultSet::execute()
 {
   int ret = common::OB_SUCCESS;
@@ -218,6 +283,7 @@ int ObResultSet::open_result()
   if (NULL != physical_plan_) {
     if (OB_ISNULL(exec_result_)) {
       ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(check_ai_strict_columns(*physical_plan_,my_session_,get_exec_context()))) {
     } else if (OB_FAIL(exec_result_->open(get_exec_context()))) {
       if (OB_TRANSACTION_SET_VIOLATION != ret && OB_TRY_LOCK_ROW_CONFLICT != ret) {
         SQL_LOG(WARN, "fail open main query", K(ret));
